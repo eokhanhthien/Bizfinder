@@ -1,0 +1,593 @@
+import React, { useState, useCallback, useEffect, useRef } from 'react';
+import { Search, MapPin, Loader2, RefreshCw, ArrowDownCircle, ExternalLink } from 'lucide-react';
+import { Business, SearchState, SortOption, HistoryItem } from './types';
+import { fetchBusinessData } from './services/geminiService';
+import Header from './components/Header';
+import BusinessCard from './components/BusinessCard';
+import EmptyState from './components/EmptyState';
+import AnalyticsDashboard from './components/AnalyticsDashboard';
+import Sidebar from './components/Sidebar';
+import BusinessDetailModal from './components/BusinessDetailModal';
+import * as XLSX from 'xlsx';
+import { useLanguage } from './contexts/LanguageContext';
+
+// Safe Storage Helper for Sandboxed Environments
+const storage = {
+  getItem: (key: string): string | null => {
+    try {
+      if (typeof window === 'undefined') return null;
+      return localStorage.getItem(key);
+    } catch (e) {
+      console.warn('LocalStorage access blocked:', e);
+      return null;
+    }
+  },
+  setItem: (key: string, value: string) => {
+    try {
+      if (typeof window !== 'undefined') localStorage.setItem(key, value);
+    } catch (e) {
+      console.warn('LocalStorage write blocked:', e);
+    }
+  },
+  removeItem: (key: string) => {
+    try {
+      if (typeof window !== 'undefined') localStorage.removeItem(key);
+    } catch (e) {
+      console.warn('LocalStorage remove blocked:', e);
+    }
+  }
+};
+
+const App: React.FC = () => {
+  const { t, language } = useLanguage();
+  
+  // --- State Initialization ---
+  
+  // Inputs
+  const [industry, setIndustry] = useState(() => storage.getItem('bizFinder_industry') || '');
+  const [mainLocation, setMainLocation] = useState(() => storage.getItem('bizFinder_location') || '');
+
+  // Settings
+  const [sortBy, setSortBy] = useState<SortOption>(SortOption.RATING_DESC);
+  const [viewMode, setViewMode] = useState<'list' | 'table'>(() => {
+    const saved = storage.getItem('bizFinder_viewMode');
+    return (saved === 'list' || saved === 'table') ? saved : 'list';
+  });
+
+  // UI Flags
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [showAnalytics, setShowAnalytics] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  
+  // Progress State
+  const [progressValue, setProgressValue] = useState(0);
+  
+  // Selected Business for Modal
+  const [selectedBusiness, setSelectedBusiness] = useState<Business | null>(null);
+
+  // Track if current session is from history to prevent duplicates
+  const [currentHistoryId, setCurrentHistoryId] = useState<string | null>(() => {
+    return storage.getItem('bizFinder_currentHistoryId');
+  });
+
+  // Data State
+  const [searchState, setSearchState] = useState<SearchState>(() => {
+    const savedData = storage.getItem('bizFinder_data');
+    if (savedData) {
+      try {
+        const parsed = JSON.parse(savedData);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+           return { isSearching: false, error: null, data: parsed, hasSearched: true, progress: undefined };
+        }
+      } catch (e) { console.error("Failed to load saved data", e); }
+    }
+    return { isSearching: false, error: null, data: [], hasSearched: false, progress: undefined };
+  });
+
+  // History State
+  const [history, setHistory] = useState<HistoryItem[]>(() => {
+    const savedHistory = storage.getItem('bizFinder_history');
+    if (savedHistory) {
+      try {
+        return JSON.parse(savedHistory);
+      } catch (e) { return []; }
+    }
+    return [];
+  });
+
+  // --- Persistence Effects ---
+  useEffect(() => storage.setItem('bizFinder_industry', industry), [industry]);
+  useEffect(() => storage.setItem('bizFinder_location', mainLocation), [mainLocation]);
+  useEffect(() => storage.setItem('bizFinder_viewMode', viewMode), [viewMode]);
+  
+  useEffect(() => {
+    if (currentHistoryId) {
+      storage.setItem('bizFinder_currentHistoryId', currentHistoryId);
+    } else {
+      storage.removeItem('bizFinder_currentHistoryId');
+    }
+  }, [currentHistoryId]);
+
+  useEffect(() => {
+    if (searchState.data.length > 0) storage.setItem('bizFinder_data', JSON.stringify(searchState.data));
+    else if (searchState.hasSearched && searchState.data.length === 0) storage.removeItem('bizFinder_data');
+  }, [searchState.data, searchState.hasSearched]);
+
+  useEffect(() => {
+    storage.setItem('bizFinder_history', JSON.stringify(history));
+  }, [history]);
+
+  // --- Progress Simulation Effect ---
+  useEffect(() => {
+    let interval: any;
+    if (searchState.isSearching) {
+      setProgressValue(5);
+      
+      let step = 0;
+      interval = setInterval(() => {
+         step++;
+         if (step < 10) {
+            setProgressValue(val => Math.min(val + Math.random() * 5, 30));
+         } else if (step < 25) {
+            setProgressValue(val => Math.min(val + Math.random() * 3, 60));
+         } else if (step < 40) {
+            setProgressValue(val => Math.min(val + Math.random() * 2, 85));
+         } else {
+            setProgressValue(90); // Hold at 90 until done
+         }
+      }, 200);
+    } else {
+      setProgressValue(100);
+      setTimeout(() => setProgressValue(0), 1000); // Reset after completion
+    }
+    return () => clearInterval(interval);
+  }, [searchState.isSearching]);
+
+  // --- Handlers ---
+
+  const saveCurrentSession = useCallback((providedData?: Business[]) => {
+    const dataToSave = providedData || searchState.data;
+    if (dataToSave.length === 0) return;
+
+    setHistory(prev => {
+      if (currentHistoryId) {
+        const existingItemIndex = prev.findIndex(item => item.id === currentHistoryId);
+        if (existingItemIndex !== -1) {
+          const updatedHistory = [...prev];
+          updatedHistory[existingItemIndex] = {
+            ...updatedHistory[existingItemIndex],
+            timestamp: Date.now(),
+            count: dataToSave.length,
+            data: dataToSave,
+          };
+          return updatedHistory;
+        }
+      }
+
+      const newItem: HistoryItem = {
+        id: Date.now().toString(),
+        timestamp: Date.now(),
+        industry: industry || 'Unknown Industry',
+        location: mainLocation || 'Unknown Location',
+        count: dataToSave.length,
+        data: dataToSave
+      };
+      
+      return [newItem, ...prev];
+    });
+  }, [searchState.data, currentHistoryId, industry, mainLocation]);
+
+  const handleUpdateBusiness = (id: string, updates: Partial<Business>) => {
+    setSearchState(prev => {
+        const newData = prev.data.map(b => b.id === id ? { ...b, ...updates } : b);
+        
+        if (currentHistoryId) {
+             setHistory(hList => hList.map(hItem => 
+                hItem.id === currentHistoryId ? { ...hItem, data: newData } : hItem
+             ));
+        }
+        
+        return { ...prev, data: newData };
+    });
+  };
+
+  const handleClearData = () => {
+    saveCurrentSession();
+    setSearchState({ isSearching: false, error: null, data: [], hasSearched: false, progress: undefined });
+    storage.removeItem('bizFinder_data');
+    setMainLocation('');
+    setIndustry('');
+    setCurrentHistoryId(null);
+    storage.removeItem('bizFinder_industry');
+    storage.removeItem('bizFinder_location');
+    setShowAnalytics(false);
+    setSelectedBusiness(null);
+    setIsSidebarOpen(true); 
+  };
+
+  const handleRestoreHistory = (item: HistoryItem) => {
+    if (currentHistoryId === item.id) {
+        setIsSidebarOpen(false);
+        return;
+    }
+
+    if (searchState.data.length > 0) {
+       saveCurrentSession();
+    }
+
+    setIndustry(item.industry);
+    setMainLocation(item.location);
+    setCurrentHistoryId(item.id);
+    
+    setSearchState({
+      isSearching: false,
+      error: null,
+      data: item.data,
+      hasSearched: true,
+      progress: undefined
+    });
+    setIsSidebarOpen(false);
+  };
+
+  const handleDeleteHistory = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setHistory(prev => prev.filter(item => item.id !== id));
+    if (currentHistoryId === id) {
+      setCurrentHistoryId(null);
+    }
+  };
+
+  const handleClearAllHistory = () => {
+    if (history.length === 0) return;
+    if (window.confirm(t('delete_confirm'))) {
+      setHistory([]);
+      if (currentHistoryId) {
+        setCurrentHistoryId(null);
+      }
+    }
+  };
+
+  const handleSearch = useCallback(async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!industry.trim() || !mainLocation.trim()) {
+      setSearchState(prev => ({ ...prev, error: "Please enter industry and main location" }));
+      return;
+    }
+    
+    if (searchState.data.length > 0) {
+       saveCurrentSession();
+    }
+
+    setCurrentHistoryId(null);
+    setSelectedBusiness(null);
+
+    setSearchState(prev => ({ 
+      ...prev, 
+      isSearching: true, 
+      error: null, 
+      hasSearched: true, 
+      progress: { current: 1, total: 1, currentArea: mainLocation },
+      data: [] 
+    }));
+
+    try {
+        // Pass language to fetchBusinessData
+        const results = await fetchBusinessData(industry, mainLocation, language, []);
+        setSearchState(prev => ({ ...prev, data: results, isSearching: false, progress: undefined }));
+    } catch (error: any) {
+      let errorMessage = error.message || "An unexpected error occurred";
+      if (errorMessage.includes("API key") || errorMessage.includes("403")) {
+          errorMessage = t('api_error');
+      }
+      setSearchState(prev => ({ ...prev, isSearching: false, error: errorMessage, progress: undefined }));
+    }
+  }, [industry, mainLocation, searchState.data, saveCurrentSession, language, t]);
+
+  const handleLoadMore = async () => {
+    setIsLoadingMore(true);
+    
+    try {
+      const existingNames = searchState.data.map(b => b.name);
+      // Pass language here as well
+      const newResults = await fetchBusinessData(industry, mainLocation, language, existingNames);
+      
+      if (newResults.length === 0) {
+        alert(t('found_all'));
+        setIsLoadingMore(false);
+        return;
+      }
+
+      const currentMap = new Map<string, Business>();
+      searchState.data.forEach(b => currentMap.set(b.googleMapsUri || `${b.name}|${b.address}`, b));
+      let addedCount = 0;
+      newResults.forEach(biz => {
+          const key = biz.googleMapsUri || `${biz.name}|${biz.address}`;
+          if (!currentMap.has(key)) { currentMap.set(key, biz); addedCount++; }
+      });
+      
+      const mergedData = Array.from(currentMap.values());
+      setSearchState(prev => ({ ...prev, data: mergedData }));
+      
+      if (currentHistoryId) {
+        saveCurrentSession(mergedData);
+      }
+      
+      if (addedCount === 0) {
+         alert(t('all_loaded'));
+      }
+
+    } catch (e: any) {
+      console.error(e);
+      let msg = "Unable to load more results. Please check your connection.";
+      if (e.message?.includes("API key") || e.toString().includes("403")) {
+        msg = t('api_error');
+      }
+      alert(msg);
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
+
+  const handleDownloadExcel = () => {
+    if (searchState.data.length === 0) return;
+    const dataForSheet = searchState.data.map(item => ({
+      "Name": item.name, 
+      "Status": item.businessStatus,
+      "Price": item.priceLevel,
+      "Address": item.address, 
+      "Rating": item.rating, 
+      "Reviews": item.reviewCount,
+      "Phone": item.phone || "", 
+      "Website": item.website || "", 
+      "Map Link": item.googleMapsUri || "",
+      "Latitude": item.lat,
+      "Longitude": item.lng,
+      "Dine In": item.serviceOptions?.dineIn ? 'Yes' : 'No',
+      "Delivery": item.serviceOptions?.delivery ? 'Yes' : 'No',
+    }));
+    const worksheet = XLSX.utils.json_to_sheet(dataForSheet);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Business Data");
+    const fileName = `${industry.replace(/\s+/g, '_')}_${mainLocation.replace(/\s+/g, '_')}_detailed.xlsx`;
+    XLSX.writeFile(workbook, fileName);
+  };
+
+  const sortedData = [...searchState.data].sort((a, b) => {
+    switch (sortBy) {
+      case SortOption.RATING_DESC: return (b.rating || 0) - (a.rating || 0);
+      case SortOption.REVIEWS_DESC: return (b.reviewCount || 0) - (a.reviewCount || 0);
+      case SortOption.NAME_ASC: return a.name.localeCompare(b.name);
+      default: return 0;
+    }
+  });
+
+  return (
+    <div className="min-h-screen flex flex-col bg-[#f8fafc]">
+      <Header onOpenSidebar={() => setIsSidebarOpen(true)} />
+
+      <Sidebar 
+        isOpen={isSidebarOpen}
+        onClose={() => setIsSidebarOpen(false)}
+        count={searchState.data.length}
+        viewMode={viewMode}
+        setViewMode={setViewMode}
+        sortBy={sortBy}
+        setSortBy={setSortBy}
+        onOpenAnalytics={() => {
+          setIsSidebarOpen(false);
+          setShowAnalytics(true);
+        }}
+        onDownloadExcel={handleDownloadExcel}
+        onClearData={handleClearData}
+        history={history}
+        onRestoreHistory={handleRestoreHistory}
+        onDeleteHistory={handleDeleteHistory}
+        onClearAllHistory={handleClearAllHistory}
+      />
+
+      {/* DETAIL MODAL */}
+      {selectedBusiness && (
+          <BusinessDetailModal 
+              data={selectedBusiness} 
+              onClose={() => setSelectedBusiness(null)} 
+          />
+      )}
+
+      <main className="flex-grow w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 pt-24 sm:pt-28">
+        
+        <div className={`bg-white rounded-3xl shadow-lg shadow-blue-900/5 border border-slate-100 p-5 mb-6 transition-all duration-300 ${searchState.data.length > 0 ? 'hidden' : 'block'}`}>
+          <form onSubmit={handleSearch} className="space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="space-y-1.5">
+                    <label htmlFor="industry" className="block text-[10px] font-bold uppercase tracking-wider text-[#005993]">{t('industry_label')}</label>
+                    <div className="relative group">
+                        <Search className="absolute left-3.5 top-3 w-4 h-4 text-slate-400 group-focus-within:text-[#005993] transition-colors" />
+                        <input
+                          type="text"
+                          id="industry"
+                          value={industry}
+                          onChange={(e) => setIndustry(e.target.value)}
+                          placeholder={t('industry_placeholder')}
+                          className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-[#7ED3F7] focus:border-[#005993] outline-none transition-all text-black font-semibold text-sm placeholder:text-slate-400 placeholder:font-normal"
+                        />
+                    </div>
+                </div>
+
+                <div className="space-y-1.5">
+                    <label htmlFor="location" className="block text-[10px] font-bold uppercase tracking-wider text-[#005993]">{t('location_label')}</label>
+                    <div className="relative group">
+                        <MapPin className="absolute left-3.5 top-3 w-4 h-4 text-slate-400 group-focus-within:text-[#005993] transition-colors" />
+                        <input
+                          type="text"
+                          id="location"
+                          value={mainLocation}
+                          onChange={(e) => setMainLocation(e.target.value)}
+                          placeholder={t('location_placeholder')}
+                          className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-[#7ED3F7] focus:border-[#005993] outline-none transition-all text-black font-semibold text-sm placeholder:text-slate-400 placeholder:font-normal"
+                        />
+                    </div>
+                </div>
+            </div>
+
+            <button
+                type="submit"
+                disabled={searchState.isSearching}
+                className="w-full md:w-auto md:min-w-[200px] bg-[#005993] active:bg-[#004d7a] active:scale-95 text-white font-bold py-3 px-6 rounded-xl shadow-lg shadow-[#005993]/20 transition-all flex items-center justify-center gap-2.5 disabled:opacity-70 disabled:cursor-not-allowed mx-auto text-base"
+              >
+                {searchState.isSearching ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    {t('searching')}
+                  </>
+                ) : (
+                  <>
+                    <RefreshCw className="w-4 h-4" />
+                    {t('start_search')}
+                  </>
+                )}
+              </button>
+          </form>
+
+          {/* Minimal Progress Timeline Overlay - ONLY THE BAR */}
+          {searchState.isSearching && (
+             <div className="mt-8 border-t border-slate-100 pt-6 animate-in fade-in slide-in-from-bottom-2">
+                 <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
+                     <div 
+                        className="h-full bg-gradient-to-r from-[#005993] to-[#7ED3F7] transition-all duration-300 ease-out"
+                        style={{ width: `${progressValue}%` }}
+                     />
+                 </div>
+             </div>
+          )}
+        </div>
+
+        {searchState.error && (
+          <div className="bg-red-50 text-[#D71249] p-4 rounded-2xl border border-red-100 mb-6 flex items-start gap-3 animate-in fade-in slide-in-from-top-4">
+            <div className="w-2 h-2 rounded-full bg-[#D71249] mt-2 shrink-0" />
+            <span className="text-sm font-medium">{searchState.error}</span>
+          </div>
+        )}
+
+        {!searchState.hasSearched && searchState.data.length === 0 ? (
+          <EmptyState />
+        ) : (
+          <div>
+            {showAnalytics && <AnalyticsDashboard data={searchState.data} onClose={() => setShowAnalytics(false)} />}
+
+            {searchState.data.length === 0 && !searchState.isSearching && !searchState.error && searchState.hasSearched && (
+               <div className="text-center py-20 bg-white rounded-3xl border border-dashed border-slate-300 mx-4">
+                  <p className="text-slate-500 font-medium">{t('no_results_maps')}</p>
+               </div>
+            )}
+
+            {/* LIST VIEW */}
+            {viewMode === 'list' && (
+              <div className="grid grid-cols-1 gap-4 mb-20 max-w-4xl mx-auto">
+                {sortedData.map((biz) => (
+                  <BusinessCard 
+                    key={biz.id} 
+                    data={biz} 
+                    onUpdate={handleUpdateBusiness}
+                    onSelect={setSelectedBusiness} 
+                  />
+                ))}
+                
+                {(isLoadingMore || searchState.isSearching) && [1, 2, 3, 4].map((i) => (
+                  <div key={`skel-${i}`} className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm h-full animate-pulse">
+                     <div className="h-6 bg-slate-200 rounded-md w-3/4 mb-3"></div>
+                     <div className="h-4 bg-slate-200 rounded w-1/2 mb-2"></div>
+                     <div className="h-20 bg-slate-100 rounded w-full"></div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* TABLE VIEW */}
+            {viewMode === 'table' && (sortedData.length > 0 || isLoadingMore || searchState.isSearching) && (
+              <div className="bg-white rounded-2xl shadow-lg shadow-slate-200/50 border border-slate-200 overflow-hidden mb-20">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-sm text-slate-600 min-w-[700px]">
+                    <thead className="bg-[#f0f9ff] border-b border-[#7ED3F7]/30 text-xs uppercase font-bold text-[#005993]">
+                      <tr>
+                        <th className="px-4 py-4 whitespace-nowrap">Business Name</th>
+                        <th className="px-4 py-4 whitespace-nowrap">Rating</th>
+                        <th className="px-4 py-4 whitespace-nowrap">Address</th>
+                        <th className="px-4 py-4 whitespace-nowrap">Contact</th>
+                        <th className="px-4 py-4 whitespace-nowrap text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {sortedData.map((biz) => (
+                        <tr 
+                            key={biz.id} 
+                            className="active:bg-slate-50 transition-colors cursor-pointer hover:bg-slate-50"
+                            onClick={() => setSelectedBusiness(biz)}
+                        >
+                          <td className="px-4 py-4 font-bold text-slate-900">
+                            <div className="line-clamp-2">{biz.name}</div>
+                            <div className="text-xs text-slate-400 font-normal mt-0.5">{biz.types?.join(', ') || biz.businessType}</div>
+                          </td>
+                          <td className="px-4 py-4">
+                            <div className="flex items-center gap-1">
+                               <span className="font-bold text-[#005993]">{biz.rating?.toFixed(1)}</span>
+                               <span className="text-xs text-slate-400">({biz.reviewCount})</span>
+                            </div>
+                          </td>
+                          <td className="px-4 py-4 max-w-[150px]">
+                            <div className="line-clamp-2 text-xs">{biz.address}</div>
+                          </td>
+                          <td className="px-4 py-4">
+                             <div className="flex flex-col gap-1">
+                                {biz.phone ? <span className="text-slate-700 text-xs font-mono">{biz.phone}</span> : <span className="text-slate-300 italic text-xs">No phone</span>}
+                             </div>
+                          </td>
+                          <td className="px-4 py-4 text-right">
+                             {biz.googleMapsUri && (
+                                <a 
+                                  href={biz.googleMapsUri} 
+                                  target="_blank" 
+                                  rel="noopener noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="inline-flex items-center justify-center p-2 text-white bg-[#005993] rounded-lg shadow-sm active:scale-90 transition-transform"
+                                >
+                                  <ExternalLink className="w-3.5 h-3.5" />
+                                </a>
+                             )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {searchState.data.length > 0 && !searchState.isSearching && (
+              <div className="fixed bottom-6 left-0 right-0 px-6 z-40 pointer-events-none flex justify-center">
+                 <button
+                  onClick={handleLoadMore}
+                  disabled={isLoadingMore}
+                  className="pointer-events-auto flex items-center gap-2 px-5 py-3 bg-[#005993] text-white font-bold rounded-full shadow-xl shadow-blue-900/30 hover:bg-[#004d7a] transition-all active:scale-95 disabled:opacity-70 disabled:scale-100 text-sm"
+                >
+                  {isLoadingMore ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      {t('loading_deep_data')}
+                    </>
+                  ) : (
+                    <>
+                      <ArrowDownCircle className="w-4 h-4" />
+                      {t('load_more')}
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </main>
+    </div>
+  );
+};
+
+export default App;
