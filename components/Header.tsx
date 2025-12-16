@@ -20,7 +20,7 @@ const Header: React.FC<Props> = ({ onOpenSidebar }) => {
             {/* Custom Logo Design */}
             <div className="relative flex items-center justify-center w-10 h-10 rounded-xl bg-gradient-to-br from-[#005993] to-[#004d7a] shadow-lg shadow-blue-900/20">
               <Compass className="w-6 h-6 text-white" />
-              <div className="absolute -top-1 -right-1 w-3 h-3 bg-[#D71249] rounded-full border-2 border-white"></div>
+              <div className="absolute -top-1 -right-1 w-3 h-3 bg-[#34D259] rounded-full border-2 border-white"></div>
             </div>
             
             <div className="flex flex-col">
