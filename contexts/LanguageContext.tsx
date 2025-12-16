@@ -12,7 +12,7 @@ const translations: Record<Language, Record<string, string>> = {
   vi: {
     // Header & General
     'app_name': 'BizFinder',
-    'app_subtitle': 'Intelligence',
+    'app_subtitle': 'thienit',
     'menu': 'Menu',
     
     // Search Form
@@ -94,7 +94,7 @@ const translations: Record<Language, Record<string, string>> = {
   en: {
     // Header & General
     'app_name': 'BizFinder',
-    'app_subtitle': 'Intelligence',
+    'app_subtitle': 'thienit',
     'menu': 'Menu',
 
     // Search Form
